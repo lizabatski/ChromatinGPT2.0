@@ -1,0 +1,31 @@
+# === DATA ===
+data/
+validation_bigwigs/
+
+# === LOGS ===
+logs/
+*.log
+
+# === PYTHON CACHE ===
+__pycache__/
+*.py[cod]
+
+# === VENV ===
+myenv/
+.env/
+.venv/
+*.egg-info/
+
+# === EDITOR/OS FILES ===
+.vscode/
+*.DS_Store
+
+# === MODEL CHECKPOINTS OR TEMP FILES ===
+*.pt
+*.ckpt
+*.npz
+
+# === SLURM JOB OUTPUT ===
+slurm-*.out
+*.err
+*.out
