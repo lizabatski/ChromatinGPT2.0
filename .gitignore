@@ -29,3 +29,12 @@ myenv/
 slurm-*.out
 *.err
 *.out
+
+# === LOCAL DEBUG/UTILITY SCRIPTS ===
+check_none.py
+fixed_pybigwig_api.py
+i.py
+inspect_npz.py
+inspect_og.py
+sample_check.py
+sample_test_npz.py

@@ -1,12 +1,10 @@
-
-
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 import argparse
 import os
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import json
 from tqdm import tqdm
 
@@ -34,12 +32,18 @@ class PreprocessedDataset(Dataset):
         if len(self.dnase.shape) == 2:
             self.dnase = np.expand_dims(self.dnase, axis=1)
         
+        # Store normalization parameters for potential reuse
+        self.normalization_params = {}
+        
         # Normalize DNase signals
         if normalize:
             # Log transform and normalize DNase
             self.dnase = np.log1p(self.dnase)
             dnase_mean = np.mean(self.dnase)
             dnase_std = np.std(self.dnase)
+            self.normalization_params['dnase_mean'] = dnase_mean
+            self.normalization_params['dnase_std'] = dnase_std
+            
             if dnase_std > 0:
                 self.dnase = (self.dnase - dnase_mean) / dnase_std
             
@@ -47,6 +51,9 @@ class PreprocessedDataset(Dataset):
             self.targets = np.log1p(self.targets)
             self.target_means = np.mean(self.targets, axis=0)
             self.target_stds = np.std(self.targets, axis=0)
+            self.normalization_params['target_means'] = self.target_means
+            self.normalization_params['target_stds'] = self.target_stds
+            
             for i in range(self.targets.shape[1]):
                 if (self.target_stds[i] > 0).any():
                     self.targets[:, i] = (self.targets[:, i] - self.target_means[i]) / self.target_stds[i]
@@ -62,23 +69,65 @@ class PreprocessedDataset(Dataset):
     def __getitem__(self, idx):
         return self.dna[idx], self.dnase[idx], self.targets[idx]
 
+def split_dataset(dataset: Dataset, train_ratio: float = 0.7, val_ratio: float = 0.15, test_ratio: float = 0.15, seed: int = 42):
+    """
+    Split dataset into train, validation, and test sets
+    
+    Args:
+        dataset: The dataset to split
+        train_ratio: Proportion for training set
+        val_ratio: Proportion for validation set  
+        test_ratio: Proportion for test set
+        seed: Random seed for reproducible splits
+    
+    Returns:
+        Tuple of (train_dataset, val_dataset, test_dataset)
+    """
+    # Ensure ratios sum to 1
+    total_ratio = train_ratio + val_ratio + test_ratio
+    if abs(total_ratio - 1.0) > 1e-6:
+        raise ValueError(f"Ratios must sum to 1.0, got {total_ratio}")
+    
+    # Set random seed for reproducible splits
+    generator = torch.Generator().manual_seed(seed)
+    
+    # Calculate sizes
+    total_size = len(dataset)
+    train_size = int(total_size * train_ratio)
+    val_size = int(total_size * val_ratio)
+    test_size = total_size - train_size - val_size  # Ensure all samples are used
+    
+    print(f"Splitting dataset of {total_size} samples:")
+    print(f"  Training: {train_size} samples ({train_size/total_size:.1%})")
+    print(f"  Validation: {val_size} samples ({val_size/total_size:.1%})")
+    print(f"  Test: {test_size} samples ({test_size/total_size:.1%})")
+    
+    # Split the dataset
+    train_dataset, val_dataset, test_dataset = random_split(
+        dataset, [train_size, val_size, test_size], generator=generator
+    )
+    
+    return train_dataset, val_dataset, test_dataset
+
 def calculate_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    """Calculate regression metrics"""
+    """Calculate regression metrics for 3D target arrays"""
     metrics = {}
     
-    # Overall metrics
+    # Overall metrics (flatten everything)
     metrics['mse'] = mean_squared_error(y_true.flatten(), y_pred.flatten())
     metrics['mae'] = mean_absolute_error(y_true.flatten(), y_pred.flatten())
     metrics['r2'] = r2_score(y_true.flatten(), y_pred.flatten())
     
-    # Per-target metrics
-    num_targets = y_true.shape[1]
-    for i in range(num_targets):
-        if i < len(TARGETS):
-            target_name = TARGETS[i]
-            metrics[f'{target_name}_mse'] = mean_squared_error(y_true[:, i], y_pred[:, i])
-            metrics[f'{target_name}_mae'] = mean_absolute_error(y_true[:, i], y_pred[:, i])
-            metrics[f'{target_name}_r2'] = r2_score(y_true[:, i], y_pred[:, i])
+    # Per-target metrics (flatten across bins for each target)
+    for i in range(min(y_true.shape[1], len(TARGETS))):
+        target_name = TARGETS[i]
+        # Flatten samples and bins for this target: (samples, bins) -> (samples*bins,)
+        true_flat = y_true[:, i, :].flatten()
+        pred_flat = y_pred[:, i, :].flatten()
+        
+        metrics[f'{target_name}_mse'] = mean_squared_error(true_flat, pred_flat)
+        metrics[f'{target_name}_mae'] = mean_absolute_error(true_flat, pred_flat)
+        metrics[f'{target_name}_r2'] = r2_score(true_flat, pred_flat)
     
     return metrics
 
@@ -113,7 +162,7 @@ def evaluate(model, val_loader, device: str) -> Tuple[float, Dict[str, float]]:
     all_targets = []
     
     with torch.no_grad():
-        for dna_batch, dnase_batch, target_batch in tqdm(val_loader, desc="Validating"):
+        for dna_batch, dnase_batch, target_batch in tqdm(val_loader, desc="Evaluating"):
             # Move to device
             if device == 'cuda':
                 dna_batch = dna_batch.cuda()
@@ -164,9 +213,13 @@ def main():
     parser = argparse.ArgumentParser(description='Train histone modification prediction model')
     
     # Data arguments
-    parser.add_argument('--train_data', required=True, help='Path to training .npz file')
-    parser.add_argument('--val_data', help='Path to validation .npz file (if not provided, splits from train)')
-    parser.add_argument('--test_data', help='Path to test .npz file')
+    parser.add_argument('--data', required=True, help='Path to the main .npz data file')
+    parser.add_argument('--train_ratio', type=float, default=0.7, 
+                       help='Proportion of data for training (default: 0.7)')
+    parser.add_argument('--val_ratio', type=float, default=0.15, 
+                       help='Proportion of data for validation (default: 0.15)')
+    parser.add_argument('--test_ratio', type=float, default=0.15, 
+                       help='Proportion of data for testing (default: 0.15)')
     
     # Model arguments
     parser.add_argument('--channels', type=int, default=768, help='Number of channels')
@@ -181,9 +234,8 @@ def main():
     
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
-    parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
+    parser.add_argument('--epochs', type=int, default=5, help='Number of epochs')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate')
-    parser.add_argument('--val_split', type=float, default=0.2, help='Validation split if no val_data provided')
     parser.add_argument('--early_stopping_patience', type=int, default=10, help='Early stopping patience')
     
     # Other arguments
@@ -191,9 +243,18 @@ def main():
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--no_cuda', action='store_true', help='Disable CUDA')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of data loader workers')
+    parser.add_argument('--save_splits', action='store_true', 
+                       help='Save the split indices for reproducibility')
     
     args = parser.parse_args()
-    print("got this far")
+    
+    # Validate split ratios
+    total_ratio = args.train_ratio + args.val_ratio + args.test_ratio
+    if abs(total_ratio - 1.0) > 1e-6:
+        raise ValueError(f"train_ratio + val_ratio + test_ratio must equal 1.0, got {total_ratio}")
+    
+    print("Starting training script...")
+    
     # Set device
     device = 'cuda' if torch.cuda.is_available() and not args.no_cuda else 'cpu'
     print(f"Using device: {device}")
@@ -207,24 +268,37 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
-    print("Before loading data")
+    print("Loading and splitting data...")
     
-    # Load data
-    train_dataset = PreprocessedDataset(args.train_data)
-
+    # Load full dataset
+    full_dataset = PreprocessedDataset(args.data, normalize=False)
     
-
-    print("After loading data")
+    # Split dataset
+    train_dataset, val_dataset, test_dataset = split_dataset(
+        full_dataset, 
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio, 
+        test_ratio=args.test_ratio,
+        seed=args.seed
+    )
     
-    # Split or load validation data
-    if args.val_data:
-        val_dataset = PreprocessedDataset(args.val_data)
-    else:
-        # Split training data
-        val_size = int(len(train_dataset) * args.val_split)
-        train_size = len(train_dataset) - val_size
-        train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])
-        print(f"Split data: {train_size} training, {val_size} validation")
+    # Save split information if requested
+    if args.save_splits:
+        split_info = {
+            'total_samples': len(full_dataset),
+            'train_indices': train_dataset.indices,
+            'val_indices': val_dataset.indices,
+            'test_indices': test_dataset.indices,
+            'split_ratios': {
+                'train': args.train_ratio,
+                'val': args.val_ratio,
+                'test': args.test_ratio
+            },
+            'seed': args.seed
+        }
+        with open(os.path.join(args.output_dir, 'split_info.json'), 'w') as f:
+            json.dump(split_info, f, indent=2)
+        print(f"Saved split information to {os.path.join(args.output_dir, 'split_info.json')}")
     
     # Create data loaders
     train_loader = DataLoader(
@@ -237,6 +311,14 @@ def main():
     
     val_loader = DataLoader(
         val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device == 'cuda')
+    )
+    
+    test_loader = DataLoader(
+        test_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -264,6 +346,8 @@ def main():
     best_val_loss = float('inf')
     patience_counter = 0
     training_history = {'train_loss': [], 'val_loss': [], 'val_metrics': []}
+    
+    print(f"\nStarting training for {args.epochs} epochs...")
     
     for epoch in range(args.epochs):
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
@@ -310,34 +394,49 @@ def main():
     with open(os.path.join(args.output_dir, 'training_history.json'), 'w') as f:
         json.dump(training_history, f, indent=2)
     
-    # Test if test data provided
-    if args.test_data:
-        print("\n" + "="*50)
-        print("Testing on test set...")
-        
-        # Load best model
-        model.load_model(os.path.join(args.output_dir, 'best_model.pth'))
-        
-        # Load test data
-        test_dataset = PreprocessedDataset(args.test_data)
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=(device == 'cuda')
-        )
-        
-        # Evaluate on test set
-        test_loss, test_metrics = evaluate(model, test_loader, device)
-        print(f"Test loss: {test_loss:.4f}")
-        print_metrics(test_metrics, "Test")
-        
-        # Save test metrics
-        with open(os.path.join(args.output_dir, 'test_metrics.json'), 'w') as f:
-            json.dump(test_metrics, f, indent=2)
+    # Test on test set
+    print("\n" + "="*50)
+    print("Testing on test set...")
     
-    print("\nTraining complete!")
+    # Load best model for testing
+    model.load_model(os.path.join(args.output_dir, 'best_model.pth'))
+    
+    # Evaluate on test set
+    test_loss, test_metrics = evaluate(model, test_loader, device)
+    print(f"Test loss: {test_loss:.4f}")
+    print_metrics(test_metrics, "Test")
+    
+    # Save test metrics
+    with open(os.path.join(args.output_dir, 'test_metrics.json'), 'w') as f:
+        json.dump(test_metrics, f, indent=2)
+    
+    # Save final summary
+    summary = {
+        'best_val_loss': best_val_loss,
+        'test_loss': test_loss,
+        'test_metrics': test_metrics,
+        'model_config': {
+            'channels': args.channels,
+            'num_transformer_layers': args.num_transformer_layers,
+            'num_heads': args.num_heads,
+            'dropout': args.dropout,
+            'fusion_type': args.fusion_type,
+            'pooling_type': args.pooling_type,
+            'num_conv_blocks': args.num_conv_blocks
+        },
+        'training_config': {
+            'batch_size': args.batch_size,
+            'learning_rate': args.learning_rate,
+            'epochs_trained': len(training_history['train_loss']),
+            'early_stopping_patience': args.early_stopping_patience
+        }
+    }
+    
+    with open(os.path.join(args.output_dir, 'summary.json'), 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    print(f"\nTraining complete! Results saved to {args.output_dir}")
+    print(f"Final test R²: {test_metrics['r2']:.4f}")
 
 if __name__ == "__main__":
     main()
